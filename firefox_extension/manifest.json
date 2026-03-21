@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "GPU Price Recommender",
+  "version": "1.0",
+  "description": "Shows recommended purchase prices on eBay and Facebook Marketplace listings",
+  "content_scripts": [
+    {
+      "matches": ["*://*.ebay.com/*", "*://*.facebook.com/marketplace/*"],
+      "js": ["data.js", "content.js"]
+    }
+  ]
+}

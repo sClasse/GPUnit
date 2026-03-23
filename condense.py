@@ -46,6 +46,7 @@ print(f"Duplicates removed. Cleaned file saved as '{output_file}'.")
 
 # --- Update the Firefox extension data file --------------------------------------------------
 # Compute average sale prices per GPU type using the last 90 days of data.
+# LOOKS LIKE THERE ARE SOME ERRORS HERE.
 df_cleaned.loc[:, "Sale Date"] = pd.to_datetime(df_cleaned["Sale Date"], errors="coerce")
 cutoff = pd.Timestamp.today() - pd.Timedelta(days=90)
 recent = df_cleaned[df_cleaned["Sale Date"] >= cutoff]

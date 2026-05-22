@@ -18,8 +18,8 @@ import random
 
 errors = []
 search_keys = [#Keywords I use in ebay previously
-    "4070", "1660", "1070", "1080", "2060", "2070", "2080", 
-    "3060", "3070", "3080", "3090", "4080", "4090", "4060",
+    "4080", "1660", "1070", "1080", "2060", "2070", "2080", 
+    "3060", "3070", "3080", "3090", "4070", "4090", "4060",
     "5060", "5070", "5080", "5090"]
 keyword_filter = [# Helps filter out unwanted listings, add here as needed
     "fan replacement", "boxes only", "box only", "shield kit", 
@@ -28,27 +28,99 @@ keyword_filter = [# Helps filter out unwanted listings, add here as needed
     "stand", "laptop", "ssd", "hz"]
 gpus = [] # Placeholder to store gpu listing data before writing to CSV
 with Stealth().use_sync(sync_playwright()) as p: #Leverage stealth to help mitigate fingerprinting
-    browser = p.chromium.launch(headless=True)#Launch chromium (chromium recommend in DOCs) but in the background
+    browser = p.chromium.launch(
+        headless=False,
+        args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-web-security"
+        ]
+        )#Launch chromium (chromium recommend in DOCs) but in the background
     context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        user_agent="AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        viewport={"width": random.randint(1280, 1440), "height": random.randint(820, 980)},
+        locale="en-US",
+        timezone_id="America/New_York",
+        screen={"width": 1920, "height": 1080},
+        device_scale_factor=1
     ) #Create a new browser context using Firefox
     page = context.new_page() #Open a new browser page within the current context/instance
     for key in search_keys:
         try:
-            page.goto(
-                'https://www.ebay.com/sch/i.html?_from=R40&_nkw=' + 
-                key + '&_sacat=0&rt=nc&LH_Sold=1&LH_Complete=1&_ipg=240'#,
-               # wait_until='domcontentloaded' ##Removing temporarily
-            ) #Navigate to the desired URL and wait for browser idle
-        #Interestingly enough both OpenAI and Copilot suggest using "wait_until" or "wait_for_selector" methods.
-        #   both of which are actively NOT recommended in Playwright docs. Instead docs recommend using the page.locator method
-        #   to handle waiting for elements.
+            # Start from eBay homepage and type the query to avoid direct-search blocking
+            page.goto("https://www.ebay.com/")
 
-            page.locator("srp-results").wait_for() #Wait for the listings to load
+            # Wait for a known search input to appear
+            try:
+                page.wait_for_selector('input#gh-ac, input[name="_nkw"], input[aria-label*="Search"]', timeout=10000)
+            except Exception:
+                # If the selector doesn't appear in time, continue — fallback below may try direct nav
+                pass
+
+            # Pick the first available search input selector
+            if page.query_selector('input#gh-ac'):
+                search_sel = 'input#gh-ac'
+            elif page.query_selector('input[name="_nkw"]'):
+                search_sel = 'input[name="_nkw"]'
+            else:
+                search_sel = 'input[aria-label*="Search"]'
+
+            # Small human-like pause before typing
+            time.sleep(random.uniform(1, 3))
+
+            # Focus, type with per-character delay, then submit
+            try:
+                page.click(search_sel)
+                page.type(search_sel, str(key), delay=random.randint(50, 150))  # ms per char
+                page.keyboard.press("Enter")
+            except Exception:
+                # If typing fails, fall back to direct navigation below
+                pass
+
+            # Wait for results to render (multiple possible containers)
+            try:
+                page.wait_for_selector('ul.srp-results, div.srp-controls, div#srp-river-results', timeout=15000)
+            except Exception:
+                pass
+
+            time.sleep(random.uniform(8,12)) #Sleep between 2-6 seconds to help mitigate bot detection
+            # Explicitly enable Sold Items and 240 results per page if present
+            try:
+                sold_checkbox = page.query_selector('input[aria-label="Sold Items"]')
+                if sold_checkbox:
+                    page.evaluate('(el) => el.click()', sold_checkbox)
+                    page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            try:
+                ipp_button = page.query_selector('button[aria-controls="srp-ipp-menu-content"]')
+                if ipp_button:
+                    ipp_button.click()
+                    page.wait_for_selector('#srp-ipp-menu-content', timeout=10000)
+                    page.click('#srp-ipp-menu-content >> text="240"')
+                    page.wait_for_selector('ul.srp-results', timeout=15000)
+            except Exception:
+                pass
+
         except Exception:
-            print("Error Loading Search Results for " + key)
-            pass
+            # Fallback: direct navigation if homepage flow fails
+            try:
+                page.goto(f'https://www.ebay.com/sch/i.html?_nkw={key}&_sacat=0&_ipg=240&rt=nc&LH_Sold=1', timeout=30000)
+                try:
+                    page.wait_for_selector('ul.srp-results', timeout=15000)
+                except Exception:
+                    pass
+            except Exception:
+                print("Error Loading Search Results for " + key)
+                pass
+
         html = page.content() #Get the final rendered HTML content after any JS has run
+        # Detect Access Denied / challenge pages and skip if encountered
+        if "Access Denied" in html or "errors.edgesuite.net" in html:
+            print("Access Denied encountered for " + key)
+            continue
         #r = requests.get('https://www.ebay.com/sch/i.html?_from=R40&_nkw=' + key + '&_sacat=0&rt=nc&LH_Sold=1&LH_Complete=1&_ipg=240')
         soup = BeautifulSoup(html, 'html.parser')
         list = soup.find('ul', class_='srp-results')
@@ -162,7 +234,7 @@ with Stealth().use_sync(sync_playwright()) as p: #Leverage stealth to help mitig
                 error['item Content'] = item
                 errors.append(error)
             gpus.append(i)
-        time.sleep(random.uniform(4,8)) #Sleep between 4-8 seconds to help mitigate bot detection
+        time.sleep(random.uniform(8,20)) #Sleep between 8-20 seconds to help mitigate bot detection
     context.close()
     browser.close()
 csv_file = "C:/Users/yeahd/Documents/Python_Projects/GPUNIT/Pulls/" + datetime.today().strftime("%m-%d-%y") + " -- GPU Sale Price.csv"

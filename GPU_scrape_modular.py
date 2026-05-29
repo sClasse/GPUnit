@@ -48,7 +48,7 @@ GPU_CONFIG = ProductConfig(
 MOTHERBOARD_CONFIG = ProductConfig(
     name="Motherboard",
     search_keywords=[
-        "B850", "B650", "B550", "B760", "X870", "Z890", "Z790", "X670"
+        "B550", "B650", "B760", "B850", "X670", "X870", "Z790", "Z890"
     ],
     keyword_filters=[
         "box only", "heatsink only", "fan replacement"
@@ -213,6 +213,9 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
     except Exception:
         i['Title'] = "Unknown"
 
+    # Determine OEM from title before any product-specific logic
+    i['OEM'] = parse_oem(i['Title'], product_config)
+
     # Check if title matches exclusion filters
     for filter_keyword in product_config.keyword_filters:
         if filter_keyword.lower() in i['Title'].lower():
@@ -325,9 +328,14 @@ def parse_gpu_type(keyword: str, title: str) -> str:
 
 def parse_motherboard_type(keyword: str, title: str) -> str:
     """Extract motherboard variant info from title"""
-    # For motherboards, the keyword itself is mostly sufficient
-    # Can be enhanced to detect variants if needed
-    return keyword
+    if 'mini' in title.lower() or 'itx' in title.lower():
+        return f"{keyword} ITX"
+    elif 'micro' in title.lower() or 'mtx' in title.lower():
+        return f"{keyword} MATX"
+    elif 'eatx' in title.lower() or 'e-atx' in title.lower() or 'extended atx' in title.lower():
+        return f"{keyword} EATX"
+    else:
+        return f"{keyword} ATX"
 
 
 def parse_ram_type(keyword: str, title: str) -> str:
@@ -337,6 +345,38 @@ def parse_ram_type(keyword: str, title: str) -> str:
     return keyword
 
 
+def parse_oem(title: str, product_config: ProductConfig) -> str:
+    """Extract OEM information from a listing title."""
+    normalized_title = title.strip()
+    if not normalized_title:
+        return "Unknown"
+
+    oem = "Unknown"
+
+    if product_config.name == "GPU":
+        known_oems = [
+            "NVIDIA", "AMD", "ASUS", "MSI", "GIGABYTE", "EVGA", "ZOTAC",
+            "PALIT", "PNY", "SAPPHIRE", "GALAX", "INNO3D", "PowerColor"
+        ]
+    elif product_config.name == "Motherboard":
+        known_oems = ["ASUS", "GIGABYTE", "MSI", "ASRock", "Biostar", "EVGA", "AORUS"]
+    elif product_config.name == "RAM":
+        known_oems = [
+            "Corsair", "G.Skill", "Kingston", "Crucial", "Patriot",
+            "Team", "ADATA", "Ballistix", "HyperX", "GeIL", "Mushkin"
+        ]
+    else:
+        known_oems = []
+
+    lower_title = normalized_title.lower()
+    for candidate in known_oems:
+        if candidate.lower() in lower_title:
+            oem = candidate
+            break
+
+    return oem
+
+
 def write_results(results: List[Dict[str, Any]], errors: List[Dict[str, Any]], product_config: ProductConfig) -> None:
     """Write results and errors to CSV files"""
     csv_file = f"{product_config.output_folder}{datetime.today().strftime('%m-%d-%y')} -- {product_config.name} Sale Price.csv"
@@ -344,12 +384,13 @@ def write_results(results: List[Dict[str, Any]], errors: List[Dict[str, Any]], p
 
     # Write results CSV
     with open(csv_file, mode="w", encoding="utf-8", newline="") as csvfile:
-        fieldnames = ["ID", "Type", "Sale Date", "Details", "Price", "Seller", "Shipping"]
+        fieldnames = ["ID", "OEM", "Type", "Sale Date", "Details", "Price", "Seller", "Shipping"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for result in results:
             writer.writerow({
                 "ID": result.get("ID", ""),
+                "OEM": result.get("OEM", "Unknown"),
                 "Type": result.get("Type", ""),
                 "Sale Date": result.get("Sale_Date", ""),
                 "Details": result.get("Details", ""),

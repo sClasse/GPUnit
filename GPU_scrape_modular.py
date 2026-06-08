@@ -1,5 +1,4 @@
-#TODO Use keyword filter list to skip unwanted listings
-#TODO The exception statement for page.goto() is saying there is error but it still works fine....
+#TODO Get list of models/variants per oem for GPU, RMA, and MOBO.
 
 # Modular eBay Scraper for GPUs, Motherboards, and RAM
 # Refactored to use reusable core functions with product-specific configurations
@@ -9,7 +8,7 @@ import csv
 from datetime import datetime
 import time
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from playwright.sync_api import sync_playwright, Page, BrowserContext
 from playwright_stealth import Stealth
@@ -22,6 +21,7 @@ class ProductConfig:
     name: str  # "GPU", "Motherboard", "RAM"
     search_keywords: List[str]
     keyword_filters: List[str]
+    oem_models: Dict[str, List[str]] = field(default_factory=dict)
     output_folder: str = "C:/Users/yeahd/Documents/Python_Projects/GPUNIT/Pulls/"
     error_folder: str = "C:/Users/yeahd/Documents/Python_Projects/GPUNIT/gpu_scrape_errors/"
 
@@ -42,7 +42,16 @@ GPU_CONFIG = ProductConfig(
         "sheil kit", "powerlink", "back plate", "accessory kit",
         "extension", "90mm", "16pin to 3x8pin", "adapter", "cable",
         "stand", "laptop", "ssd", "hz"
-    ]
+    ],
+    oem_models={
+        "asus": ["tuf", "rog", "strix", "prime", "dual", "proart"],
+        "evga": ["xc3", "ftw3", "ftw", "kingpin", "classified", "hybrid", "hydro copper", "xc ultra", "xc", "sc", "gaming", "black", "ko"],
+        "gigabyte": ["aorus", "windforce", "eagle", "gaming", "aero", "vision", "master", "xtreme waterforce"],
+        "msi": ["suprim", "vanguard", "expert", "gaming", "slim", "inspire", "ventus", "shadow", "mech", "lightning", "duke", "aero", "classic"],
+        "palit": ["storm-x", "gamerock", "gamingpro", "dual", "infinity", "jetstream", "white", "oc"],
+        "pny": ["oc", "argb", "verto"],
+        "zotac": ["solid", "twin edge", "amp extreme", "amp", "solo", "trinity"]
+    }
 )
 
 MOTHERBOARD_CONFIG = ProductConfig(
@@ -52,7 +61,16 @@ MOTHERBOARD_CONFIG = ProductConfig(
     ],
     keyword_filters=[
         "box only", "heatsink only", "fan replacement"
-    ]
+    ],
+    oem_models={
+        "asus": ["rog maximus", "rog strix", "tuf", "prime", "proart"],
+        "msi": ["meg", "mpg", "mag", "pro", "creator", "tomahawk", "gaming"],
+        "gigabyte": ["aorus", "aero", "gaming", "eagle"],
+        "asrock": ["aqua", "taichi", "creator", "steel legend", "livemixer", "extreme", "pro", "oc"],
+        "nzxt": ["n5", "n7", "n9"],
+        "zotac": []
+    }
+    
 )
 
 # Auto-generate RAM keywords for all DDR4 and DDR5 sizes (4GB to 128GB)
@@ -68,7 +86,17 @@ RAM_CONFIG = ProductConfig(
     search_keywords=ram_keywords,
     keyword_filters=[
         "box only", "boxes only", "adaptor"
-    ]
+    ],
+    oem_models={
+        "corsair": ["dominator", "vengeance rgb", "vengeance lpx", "vengeance" ],
+        "g.skill": ["trident z5", "trident z royal", "trident", "ripjaw", "flare", "aegis", "sniper", "valor"],
+        "kingston": ["renegade", "beast", "impact"],
+        "crucial": ["pro", "standard"],
+        "teamgroup": ["delta rgb", "delta tuf", "vulcan", "xtreem", "dark", "expert", "classic"],
+        "adata": ["xpg lancer", "xpg spectrix", "xpg gammix", "premier"],
+        "patriot": ["xtreme", "elite", "venom", "steel", "4", "elite", "signature"],
+        "mushkin": ["pro", "lumina", "essentials", "proline", "redline"]
+    }
 )
 
 
@@ -77,32 +105,36 @@ RAM_CONFIG = ProductConfig(
 # ============================================================================
 
 def setup_browser():
-    """Initialize Playwright with Stealth and return browser & context"""
+    """Initialize Playwright with Stealth and return browser, context, page, and the Playwright manager."""
     stealth = Stealth()
     p = stealth.use_sync(sync_playwright())
     context_manager = p.__enter__()
 
-    browser = context_manager.chromium.launch(
-        headless=False,
-        args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-web-security"
-        ]
-    )
+    try:
+        browser = context_manager.chromium.launch(
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-web-security"
+            ]
+        )
 
-    context = browser.new_context(
-        user_agent="AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        viewport={"width": random.randint(1280, 1440), "height": random.randint(820, 980)},
-        locale="en-US",
-        timezone_id="America/New_York",
-        screen={"width": 1920, "height": 1080},
-        device_scale_factor=1
-    )
+        context = browser.new_context(
+            user_agent="AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            viewport={"width": random.randint(1280, 1440), "height": random.randint(820, 980)},
+            locale="en-US",
+            timezone_id="America/New_York",
+            screen={"width": 1920, "height": 1080},
+            device_scale_factor=1
+        )
 
-    page = context.new_page()
-    return browser, context, page
+        page = context.new_page()
+        return p, browser, context, page
+    except Exception:
+        p.__exit__(None, None, None)
+        raise
 
 
 def search_ebay(page: Page, keyword: str) -> str:
@@ -147,11 +179,16 @@ def search_ebay(page: Page, keyword: str) -> str:
         # Explicitly enable Sold Items and 240 results per page if present
         try:
             sold_checkbox = page.query_selector('input[aria-label="Sold Items"]')
+            print(f"[DEBUG] Searching for Sold Items checkbox for keyword={keyword}")
             if sold_checkbox:
+                print(f"[DEBUG] Found Sold Items checkbox; visible={sold_checkbox.is_visible()}, enabled={sold_checkbox.is_enabled()}")
                 page.evaluate('(el) => el.click()', sold_checkbox)
                 page.wait_for_timeout(2000)
-        except Exception:
-            pass
+                print(f"[DEBUG] Clicked Sold Items checkbox for keyword={keyword}")
+            else:
+                print(f"[DEBUG] Sold Items checkbox not found for keyword={keyword}")
+        except Exception as e:
+            print(f"[DEBUG] Sold Items click exception for keyword={keyword}: {e}")
 
         try:
             ipp_button = page.query_selector('button[aria-controls="srp-ipp-menu-content"]')
@@ -215,6 +252,7 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
 
     # Determine OEM from title before any product-specific logic
     i['OEM'] = parse_oem(i['Title'], product_config)
+    i['Model'] = parse_model(i['Title'], product_config, i['OEM'])
 
     # Check if title matches exclusion filters
     for filter_keyword in product_config.keyword_filters:
@@ -351,8 +389,19 @@ def parse_oem(title: str, product_config: ProductConfig) -> str:
     if not normalized_title:
         return "Unknown"
 
+    lower_title = normalized_title.lower()
     oem = "Unknown"
 
+    # Prefer configured OEMs when they exist
+    if getattr(product_config, 'oem_models', None):
+        # Sort longest OEM names first so multi-word names are matched before shorter substrings
+        for candidate in sorted(product_config.oem_models.keys(), key=len, reverse=True):
+            if candidate.lower() in lower_title:
+                if candidate.isalpha() and len(candidate) <= 4:
+                    return candidate.upper()
+                return candidate.title()
+    
+    # Fallback to hardcoded OEM lists when oem_models is not present
     if product_config.name == "GPU":
         known_oems = [
             "NVIDIA", "AMD", "ASUS", "MSI", "GIGABYTE", "EVGA", "ZOTAC",
@@ -368,13 +417,36 @@ def parse_oem(title: str, product_config: ProductConfig) -> str:
     else:
         known_oems = []
 
-    lower_title = normalized_title.lower()
     for candidate in known_oems:
         if candidate.lower() in lower_title:
             oem = candidate
             break
 
     return oem
+
+
+def parse_model(title: str, product_config: ProductConfig, oem: str | None = None) -> str:
+    """Extract OEM-specific model information from a listing title."""
+    normalized_title = title.lower()
+    model_candidates: List[str] = []
+
+    if getattr(product_config, 'oem_models', None):
+        oem_key = oem.lower() if oem else None
+        if oem_key and oem_key in product_config.oem_models:
+            model_candidates = product_config.oem_models[oem_key]
+        else:
+            for models in product_config.oem_models.values():
+                model_candidates.extend(models)
+
+    if not model_candidates:
+        return "Unknown"
+
+    # Match longest model names first to avoid partial collisions
+    for model in sorted(set(model_candidates), key=len, reverse=True):
+        if model and re.search(rf"\b{re.escape(model)}\b", normalized_title):
+            return model
+
+    return "Unknown"
 
 
 def write_results(results: List[Dict[str, Any]], errors: List[Dict[str, Any]], product_config: ProductConfig) -> None:
@@ -384,13 +456,14 @@ def write_results(results: List[Dict[str, Any]], errors: List[Dict[str, Any]], p
 
     # Write results CSV
     with open(csv_file, mode="w", encoding="utf-8", newline="") as csvfile:
-        fieldnames = ["ID", "OEM", "Type", "Sale Date", "Details", "Price", "Seller", "Shipping"]
+        fieldnames = ["ID", "OEM", "Model", "Type", "Sale Date", "Details", "Price", "Seller", "Shipping"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for result in results:
             writer.writerow({
                 "ID": result.get("ID", ""),
                 "OEM": result.get("OEM", "Unknown"),
+                "Model": result.get("Model", "Unknown"),
                 "Type": result.get("Type", ""),
                 "Sale Date": result.get("Sale_Date", ""),
                 "Details": result.get("Details", ""),
@@ -431,7 +504,7 @@ def scrape_ebay(product_config: ProductConfig) -> tuple[List[Dict[str, Any]], Li
     results = []
     errors = []
 
-    browser, context, page = setup_browser()
+    p, browser, context, page = setup_browser()
 
     try:
         for keyword in product_config.search_keywords:
@@ -468,8 +541,18 @@ def scrape_ebay(product_config: ProductConfig) -> tuple[List[Dict[str, Any]], Li
             time.sleep(random.uniform(8, 20))
 
     finally:
-        context.close()
-        browser.close()
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            p.__exit__(None, None, None)
+        except Exception:
+            pass
 
     print(f"\n✓ Scraped {len(results)} {product_config.name} listings")
     print(f"✓ Encountered {len(errors)} errors")
@@ -521,6 +604,6 @@ def scrape_all() -> Dict[str, tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]
 if __name__ == "__main__":
     # Choose which scraper to run:
     # scrape_gpus()
-    # scrape_motherboards()
+    scrape_motherboards()
     # scrape_ram()
-    scrape_all()
+    # scrape_all()

@@ -1,6 +1,3 @@
-#TODO Use keyword filter list to skip unwanted listings
-#TODO The exception statment for page.goto() is saying there is error but it still works fine....
-
 #Sometime after August 15th 2025, eBay changed the HTML structure of their search results page.
 #       s-item__caption changed to s-card__caption. 
 #Current State ------ Need to add try except blocks for title section
@@ -25,7 +22,7 @@ keyword_filter = [# Helps filter out unwanted listings, add here as needed
     "fan replacement", "boxes only", "box only", "shield kit", 
     "sheil kit", "powerlink", "back plate", "accessory kit",
     "extension", "90mm", "16pin to 3x8pin", "adapter", "cable", 
-    "stand", "laptop", "ssd", "hz"]
+    "stand", "laptop", "ssd", "hz", "q4060", "optiplex"]
 gpus = [] # Placeholder to store gpu listing data before writing to CSV
 with Stealth().use_sync(sync_playwright()) as p: #Leverage stealth to help mitigate fingerprinting
     browser = p.chromium.launch(
@@ -88,11 +85,16 @@ with Stealth().use_sync(sync_playwright()) as p: #Leverage stealth to help mitig
             # Explicitly enable Sold Items and 240 results per page if present
             try:
                 sold_checkbox = page.query_selector('input[aria-label="Sold Items"]')
+                print(f"[DEBUG] Searching for Sold Items checkbox for key={key}")
                 if sold_checkbox:
+                    print(f"[DEBUG] Found Sold Items checkbox; visible={sold_checkbox.is_visible()}, enabled={sold_checkbox.is_enabled()}")
                     page.evaluate('(el) => el.click()', sold_checkbox)
                     page.wait_for_timeout(2000)
-            except Exception:
-                pass
+                    print(f"[DEBUG] Clicked Sold Items checkbox for key={key}")
+                else:
+                    print(f"[DEBUG] Sold Items checkbox not found for key={key}")
+            except Exception as e:
+                print(f"[DEBUG] Sold Items click exception for key={key}: {e}")
 
             try:
                 ipp_button = page.query_selector('button[aria-controls="srp-ipp-menu-content"]')

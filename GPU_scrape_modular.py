@@ -1,4 +1,5 @@
-#TODO Get list of models/variants per oem for GPU, RMA, and MOBO.
+#TODO Update firefix extension to work with oems and models
+#TODO Add motherboard and ram data to firefox extension
 
 # Modular eBay Scraper for GPUs, Motherboards, and RAM
 # Refactored to use reusable core functions with product-specific configurations
@@ -604,6 +605,6 @@ def scrape_all() -> Dict[str, tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]
 if __name__ == "__main__":
     # Choose which scraper to run:
     # scrape_gpus()
-    scrape_motherboards()
+    #scrape_motherboards()
     # scrape_ram()
-    # scrape_all()
+     scrape_all()

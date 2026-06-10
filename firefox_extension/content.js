@@ -113,6 +113,59 @@ function clearOverlay() {
   if (existing) existing.remove();
 }
 
+// Detect category from title: GPU, RAM, Motherboard
+function detectCategory(title) {
+  if (!title) return 'GPU';
+  const t = title.toLowerCase();
+  if (/\bddr\d\b/.test(t) || /\bram\b/.test(t) || /\bmemory\b/.test(t)) return 'RAM';
+  if (/motherboard|mobo|\bmb\b|chipset|\b(b|z|x)\d{3,4}\b/i.test(t)) return 'Motherboard';
+  if (extractGpuType(title)) return 'GPU';
+  return 'GPU';
+}
+
+// Try to extract OEM (brand) and Model from title using heuristics
+function extractOEMModel(title) {
+  if (!title) return { oem: null, model: null };
+  const t = title.trim();
+  const brands = ['ASUS','MSI','GIGABYTE','EVGA','ZOTAC','PNY','SAPPHIRE','XFX','PALIT','GALAX','CORSAIR','G.SKILL','KINGSTON','CRUCIAL','TEAM','PATRIOT','ASRock','BIOSTAR','INTEL','AMD'];
+  let oem = null;
+  for (const b of brands) {
+    const re = new RegExp('\\b' + b + '\\b', 'i');
+    if (re.test(t)) { oem = b; break; }
+  }
+  const modelMatch = t.match(/(ROG STRIX|TUF GAMING|VENTUS|SUPRIM|GAMING X TRIO|GAMING X|VENGEANCE LPX|VENGEANCE|TRIDENT Z|DOMINATOR|STRIX|B\d{3,4}[A-Z\-]*|Z\d{3,4}[A-Z\-]*|X\d{3,4}[A-Z\-]*|RTX\s*-?\s*\d{3,4}(?:\s*TI|\s*SUPER)?|GTX\s*-?\s*\d{3,4}|RX\s*-?\s*\d{3,4}(?:\s*XT|\s*XTX)?)/i);
+  let model = modelMatch ? modelMatch[0].trim() : null;
+  if (!model && oem) {
+    const re = new RegExp(oem + '\\s+([A-Z0-9][A-Za-z0-9\\- ]{1,40})', 'i');
+    const m = t.match(re);
+    if (m) model = m[1].trim().split(/\s{2,}|\s/).slice(0,4).join(' ');
+  }
+  return { oem: oem, model: model };
+}
+
+// Find the best matching key in category data using candidate strings
+function findBestMatch(categoryData, candidates) {
+  if (!categoryData) return null;
+  for (const c of candidates) {
+    if (!c) continue;
+    if (categoryData[c]) return categoryData[c];
+  }
+  const keys = Object.keys(categoryData);
+  for (const c of candidates) {
+    if (!c) continue;
+    const lc = c.toLowerCase();
+    const k = keys.find(k => k.toLowerCase() === lc);
+    if (k) return categoryData[k];
+  }
+  for (const c of candidates) {
+    if (!c) continue;
+    const lc = c.toLowerCase();
+    const k = keys.find(k => k.toLowerCase().includes(lc) || lc.includes(k.toLowerCase()));
+    if (k) return categoryData[k];
+  }
+  return null;
+}
+
 function showMessage(message, gpuType = 'GPU') {
   clearOverlay();
   const div = document.createElement('div');
@@ -161,29 +214,39 @@ function attemptShowRecommendation() {
     if (titleEl) break;
   }
   const title = titleEl ? titleEl.textContent : document.title;
-  const gpuType = extractGpuType(title);
   const currentPrice = extractPrice();
-  const average = gpuType ? gpuAverages[gpuType] : null;
+  const category = detectCategory(title);
+  const { oem, model } = extractOEMModel(title);
+  const dataByCategory = window.dataByCategory || { GPU: window.gpuAverages || {}, RAM: window.ramAverages || {}, Motherboard: window.motherboardAverages || {} };
+  const categoryData = dataByCategory[category] || {};
 
-  console.log('Title used for GPU extraction:', title);
-  console.log('GPU Type detected:', gpuType);
+  // Candidate keys to try: model, OEM+model, gpuType (for GPUs), title fragments
+  const gpuType = extractGpuType(title);
+  const candidates = [];
+  if (model) candidates.push(model);
+  if (oem && model) candidates.push(`${oem} ${model}`);
+  if (gpuType) candidates.push(gpuType);
+  candidates.push(title.trim());
+
+  const average = findBestMatch(categoryData, candidates) || null;
+
+  console.log('Title used for extraction:', title);
+  console.log('Detected category:', category);
+  console.log('OEM/model detected:', oem, model);
   console.log('Current Price detected:', currentPrice);
-  console.log('Average for type:', average);
+  console.log('Average matched:', average);
 
-  if (!gpuType) {
-    showMessage(`Could not detect a GPU model from the title: "${title}"`);
-    return false;
-  }
-  if (!average || !average.used) {
-    showMessage(`No average price available for "${gpuType}".`, gpuType);
+  if (!average) {
+    showMessage(`No average price available for this listing.`, category);
     return false;
   }
   if (!currentPrice) {
-    showMessage('Could not detect the current listing price.', gpuType);
+    showMessage('Could not detect the current listing price.', category);
     return false;
   }
 
-  showRecommendation(average, currentPrice, gpuType);
+  const displayLabel = model || gpuType || title;
+  showRecommendation(average, currentPrice, displayLabel);
   return true;
 }
 
@@ -208,18 +271,21 @@ function addBadgeToItem(item, statusIndicator, textColor, gpuData, currentPrice)
   `;
   
   // Calculate percentage differences
-  const usedDiff = ((currentPrice - gpuData.usedPrice) / gpuData.usedPrice * 100).toFixed(0);
-  const partsDiff = gpuData.partsPrice > 0 ? ((currentPrice - gpuData.partsPrice) / gpuData.partsPrice * 100).toFixed(0) : null;
+  const usedPriceVal = Number(gpuData.usedPrice) || 0;
+  const partsPriceVal = Number(gpuData.partsPrice) || 0;
+  const usedDiff = usedPriceVal ? ((currentPrice - usedPriceVal) / usedPriceVal * 100).toFixed(0) : 'N/A';
+  const partsDiff = partsPriceVal ? ((currentPrice - partsPriceVal) / partsPriceVal * 100).toFixed(0) : null;
   
   // Determine color for percentages (green for negative/cheap, red for positive/expensive)
   const usedColor = usedDiff < 0 ? '#00aa00' : '#cc0000';
   const partsColor = partsDiff < 0 ? '#00aa00' : '#cc0000';
   
-  // Build badge content with GPU type and colored prices
-  let badgeHTML = `${gpuData.type}<br>`;
-  badgeHTML += `Used: $${gpuData.usedPrice} <span style="color: ${usedColor}">(${usedDiff > 0 ? '+' : ''}${usedDiff}%)</span> [${gpuData.usedVol}]<br>`;
-  if (gpuData.partsPrice > 0) {
-    badgeHTML += `Parts: $${gpuData.partsPrice} <span style="color: ${partsColor}">(${partsDiff > 0 ? '+' : ''}${partsDiff}%)</span> [${gpuData.partsVol}]`;
+  // Build badge content with item label and colored prices
+  const label = gpuData.type || gpuData.label || gpuData.model || gpuData.oem || 'Item';
+  let badgeHTML = `${label}<br>`;
+  badgeHTML += `Used: $${usedPriceVal} <span style="color: ${usedColor}">(${usedDiff !== 'N/A' ? (usedDiff > 0 ? '+' : '') + usedDiff + '%' : 'N/A'})</span> [${gpuData.usedVol || 0}]<br>`;
+  if (partsPriceVal > 0) {
+    badgeHTML += `Parts: $${partsPriceVal} <span style="color: ${partsColor}">(${partsDiff > 0 ? '+' : ''}${partsDiff}%)</span> [${gpuData.partsVol || 0}]`;
   } else {
     badgeHTML += `Parts: N/A`;
   }
@@ -264,37 +330,43 @@ function processSearchResults() {
     if (!priceMatch) return;
 
     const price = parseFloat(priceMatch[1]);
+    const category = detectCategory(title);
+    const { oem, model } = extractOEMModel(title);
+    const dataByCategory = window.dataByCategory || { GPU: window.gpuAverages || {}, RAM: window.ramAverages || {}, Motherboard: window.motherboardAverages || {} };
+    const categoryData = dataByCategory[category] || {};
     const gpuType = extractGpuType(title);
-    const average = gpuType ? gpuAverages[gpuType] : null;
-    if (!gpuType || !average) return;
+    const candidates = [];
+    if (model) candidates.push(model);
+    if (oem && model) candidates.push(`${oem} ${model}`);
+    if (gpuType) candidates.push(gpuType);
+    candidates.push(title.trim());
+    const average = findBestMatch(categoryData, candidates);
+    if (!average) return;
 
-    // Use the used price as the baseline for comparison
     const baseline = average.used || average;
     const recommended = baseline * 0.8;
-    
-    // Build GPU data object
-    const gpuData = {
-      type: gpuType,
+
+    const itemData = {
+      label: model || gpuType || title,
       usedPrice: average.used,
       partsPrice: average.parts || 0,
       usedVol: average.usedVol || 0,
       partsVol: average.partsVol || 0
     };
-    
-    // Determine status indicator and color based on price comparison
+
     let statusIndicator, textColor;
     if (price <= recommended) {
       statusIndicator = '✓';
-      textColor = '#00aa00';  // Green - great deal
+      textColor = '#00aa00';
     } else if (price <= baseline) {
       statusIndicator = '⚠️';
-      textColor = '#ff9900';  // Yellow/Orange - fair price
+      textColor = '#ff9900';
     } else {
       statusIndicator = '✕';
-      textColor = '#cc0000';  // Red - overpriced
+      textColor = '#cc0000';
     }
-    
-    addBadgeToItem(item, statusIndicator, textColor, gpuData, price);
+
+    addBadgeToItem(item, statusIndicator, textColor, itemData, price);
   });
 }
 

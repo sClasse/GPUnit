@@ -125,7 +125,7 @@ def clean_and_dedup(csv_path: str) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
 
-    df["Price"] = pd.to_numeric(df["Price"].astype(str).replace('[\$,]', '', regex=True), errors='coerce')
+    df["Price"] = pd.to_numeric(df["Price"].astype(str).replace(r'[\$,]', '', regex=True), errors='coerce')
     df_cleaned = df.drop_duplicates().copy()
     print(f"{os.path.basename(csv_path)}: rows after dedup: {len(df_cleaned.index)}")
     out_path = os.path.join(os.path.dirname(csv_path), f"{os.path.splitext(os.path.basename(csv_path))[0].replace(' Sale Price','')} Cleaned.csv")
@@ -135,7 +135,13 @@ def clean_and_dedup(csv_path: str) -> pd.DataFrame:
 
 def compute_averages_for_df(df_cleaned: pd.DataFrame) -> dict:
     if df_cleaned.empty:
-        return {"used": {}, "parts": {}, "usedVol": {}, "partsVol": {}}
+        empty_group = {"used": {}, "parts": {}, "usedVol": {}, "partsVol": {}}
+        return {
+            "types": empty_group,
+            "oems": empty_group,
+            "models": empty_group,
+            "modelOnly": empty_group,
+        }
 
     df_cleaned["Sale Date"] = pd.to_datetime(df_cleaned["Sale Date"], errors='coerce')
     cutoff = pd.Timestamp.today() - pd.Timedelta(days=90)
@@ -146,19 +152,74 @@ def compute_averages_for_df(df_cleaned: pd.DataFrame) -> dict:
     if "Details" not in recent.columns:
         recent["Details"] = ""
 
-    used_df = recent[recent["Details"].astype(str).str.lower() != "parts"]
-    parts_df = recent[recent["Details"].astype(str).str.lower() == "parts"]
+    def _grouped_stats(df, group_cols):
+        group = df.groupby(group_cols)["Price"]
+        avg = group.mean().round(2).to_dict()
+        vol = group.size().to_dict()
+        return avg, vol
 
-    used_avg = used_df.groupby("Type")["Price"].mean().round(2)
-    used_vol = used_df.groupby("Type").size()
-    parts_avg = parts_df.groupby("Type")["Price"].mean().round(2)
-    parts_vol = parts_df.groupby("Type").size()
+    used_df = recent[recent["Details"].astype(str).str.lower() != "parts"].copy()
+    parts_df = recent[recent["Details"].astype(str).str.lower() == "parts"].copy()
+
+    types_used_avg, types_used_vol = _grouped_stats(used_df, ["Type"])
+    types_parts_avg, types_parts_vol = _grouped_stats(parts_df, ["Type"])
+
+    oems_used_df = used_df[used_df["OEM"].astype(str).str.strip() != ""]
+    oems_parts_df = parts_df[parts_df["OEM"].astype(str).str.strip() != ""]
+    oems_used_avg, oems_used_vol = _grouped_stats(oems_used_df, ["OEM"])
+    oems_parts_avg, oems_parts_vol = _grouped_stats(oems_parts_df, ["OEM"])
+
+    models_used_df = used_df[(used_df["OEM"].astype(str).str.strip() != "") & (used_df["Model"].astype(str).str.strip() != "")]
+    models_parts_df = parts_df[(parts_df["OEM"].astype(str).str.strip() != "") & (parts_df["Model"].astype(str).str.strip() != "")]
+    models_used_avg, models_used_vol = _grouped_stats(models_used_df, ["Type", "OEM", "Model"])
+    models_parts_avg, models_parts_vol = _grouped_stats(models_parts_df, ["Type", "OEM", "Model"])
+
+    model_only_used_df = used_df[used_df["Model"].astype(str).str.strip() != ""]
+    model_only_parts_df = parts_df[parts_df["Model"].astype(str).str.strip() != ""]
+    model_only_used_avg, model_only_used_vol = _grouped_stats(model_only_used_df, ["Model"])
+    model_only_parts_avg, model_only_parts_vol = _grouped_stats(model_only_parts_df, ["Model"])
+
+    def _dictify_model_keys_by_type(d):
+        """Convert (type, oem, model) tuples into nested Type -> OEM -> Model structure."""
+        result = {}
+        for (typ, oem, model), value in d.items():
+            if typ not in result:
+                result[typ] = {}
+            if oem not in result[typ]:
+                result[typ][oem] = {}
+            result[typ][oem][model] = value
+        return result
+
+    models_by_type_used = _dictify_model_keys_by_type(models_used_avg)
+    models_by_type_parts = _dictify_model_keys_by_type(models_parts_avg)
+    models_by_type_used_vol = _dictify_model_keys_by_type(models_used_vol)
+    models_by_type_parts_vol = _dictify_model_keys_by_type(models_parts_vol)
 
     return {
-        "used": used_avg.to_dict(),
-        "parts": parts_avg.to_dict(),
-        "usedVol": used_vol.to_dict(),
-        "partsVol": parts_vol.to_dict(),
+        "types": {
+            "used": types_used_avg,
+            "parts": types_parts_avg,
+            "usedVol": types_used_vol,
+            "partsVol": types_parts_vol,
+        },
+        "oems": {
+            "used": oems_used_avg,
+            "parts": oems_parts_avg,
+            "usedVol": oems_used_vol,
+            "partsVol": oems_parts_vol,
+        },
+        "models": {
+            "used": models_by_type_used,
+            "parts": models_by_type_parts,
+            "usedVol": models_by_type_used_vol,
+            "partsVol": models_by_type_parts_vol,
+        },
+        "modelOnly": {
+            "used": model_only_used_avg,
+            "parts": model_only_parts_avg,
+            "usedVol": model_only_used_vol,
+            "partsVol": model_only_parts_vol,
+        },
     }
 
 
@@ -171,19 +232,61 @@ def update_firefox_data_js(root_dir: str, category_averages: dict):
         jsfile.write("const dataByCategory = {\n")
         for cat, avgs in category_averages.items():
             jsfile.write(f"  '{cat}': {{\n")
-            types = sorted(set(list(avgs['used'].keys()) + list(avgs['parts'].keys())))
-            for t in types:
+            # types
+            jsfile.write("    types: {\n")
+            type_keys = sorted(set(list(avgs['types']['used'].keys()) + list(avgs['types']['parts'].keys())))
+            for t in type_keys:
                 key = str(t).replace("'", "\\'")
-                used = avgs['used'].get(t, 0) or 0
-                parts = avgs['parts'].get(t, 0) or 0
-                used_vol = int(avgs['usedVol'].get(t, 0) or 0)
-                parts_vol = int(avgs['partsVol'].get(t, 0) or 0)
-                jsfile.write(f"    '{key}': {{ used: {used}, parts: {parts}, usedVol: {used_vol}, partsVol: {parts_vol} }},\n")
+                used = avgs['types']['used'].get(t, 0) or 0
+                parts = avgs['types']['parts'].get(t, 0) or 0
+                used_vol = int(avgs['types']['usedVol'].get(t, 0) or 0)
+                parts_vol = int(avgs['types']['partsVol'].get(t, 0) or 0)
+                jsfile.write(f"      '{key}': {{ used: {used}, parts: {parts}, usedVol: {used_vol}, partsVol: {parts_vol} }},\n")
+            jsfile.write("    },\n")
+            # OEMs
+            jsfile.write("    oems: {\n")
+            oem_keys = sorted(set(list(avgs['oems']['used'].keys()) + list(avgs['oems']['parts'].keys())))
+            for oem in oem_keys:
+                key = str(oem).replace("'", "\\'")
+                used = avgs['oems']['used'].get(oem, 0) or 0
+                parts = avgs['oems']['parts'].get(oem, 0) or 0
+                used_vol = int(avgs['oems']['usedVol'].get(oem, 0) or 0)
+                parts_vol = int(avgs['oems']['partsVol'].get(oem, 0) or 0)
+                jsfile.write(f"      '{key}': {{ used: {used}, parts: {parts}, usedVol: {used_vol}, partsVol: {parts_vol} }},\n")
+            jsfile.write("    },\n")
+            # models nested by Type, then OEM, then Model
+            jsfile.write("    models: {\n")
+            for typ, by_oem in sorted(avgs['models']['used'].items()):
+                typ_key = str(typ).replace("'", "\\'")
+                jsfile.write(f"      '{typ_key}': {{\n")
+                for oem, models in sorted(by_oem.items()):
+                    omekey = str(oem).replace("'", "\\'")
+                    jsfile.write(f"        '{omekey}': {{\n")
+                    for model, used in sorted(models.items()):
+                        mkey = str(model).replace("'", "\\'")
+                        parts = avgs['models']['parts'].get(typ, {}).get(oem, {}).get(model, 0) or 0
+                        used_vol = int(avgs['models']['usedVol'].get(typ, {}).get(oem, {}).get(model, 0) or 0)
+                        parts_vol = int(avgs['models']['partsVol'].get(typ, {}).get(oem, {}).get(model, 0) or 0)
+                        jsfile.write(f"          '{mkey}': {{ used: {used}, parts: {parts}, usedVol: {used_vol}, partsVol: {parts_vol} }},\n")
+                    jsfile.write("        },\n")
+                jsfile.write("      },\n")
+            jsfile.write("    },\n")
+            # model-only averages
+            jsfile.write("    modelOnly: {\n")
+            model_only_keys = sorted(set(list(avgs['modelOnly']['used'].keys()) + list(avgs['modelOnly']['parts'].keys())))
+            for model in model_only_keys:
+                key = str(model).replace("'", "\\'")
+                used = avgs['modelOnly']['used'].get(model, 0) or 0
+                parts = avgs['modelOnly']['parts'].get(model, 0) or 0
+                used_vol = int(avgs['modelOnly']['usedVol'].get(model, 0) or 0)
+                parts_vol = int(avgs['modelOnly']['partsVol'].get(model, 0) or 0)
+                jsfile.write(f"      '{key}': {{ used: {used}, parts: {parts}, usedVol: {used_vol}, partsVol: {parts_vol} }},\n")
+            jsfile.write("    },\n")
             jsfile.write("  },\n")
         jsfile.write("};\n\n")
-        jsfile.write("const gpuAverages = dataByCategory.GPU || {};\n")
-        jsfile.write("const ramAverages = dataByCategory.RAM || {};\n")
-        jsfile.write("const motherboardAverages = dataByCategory.Motherboard || {};\n")
+        jsfile.write("const gpuAverages = dataByCategory.GPU ? dataByCategory.GPU.types : {};\n")
+        jsfile.write("const ramAverages = dataByCategory.RAM ? dataByCategory.RAM.types : {};\n")
+        jsfile.write("const motherboardAverages = dataByCategory.Motherboard ? dataByCategory.Motherboard.types : {};\n")
 
     print(f"Updated '{data_js_path}' with categories: {', '.join(sorted(category_averages.keys()))}.")
 

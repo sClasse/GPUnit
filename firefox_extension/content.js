@@ -117,9 +117,10 @@ function clearOverlay() {
 function detectCategory(title) {
   if (!title) return 'GPU';
   const t = title.toLowerCase();
+  // GPU detection should take priority over RAM/motherboard heuristics
+  if (extractGpuType(title)) return 'GPU';
   if (/\bddr\d\b/.test(t) || /\bram\b/.test(t) || /\bmemory\b/.test(t)) return 'RAM';
   if (/motherboard|mobo|\bmb\b|chipset|\b(b|z|x)\d{3,4}\b/i.test(t)) return 'Motherboard';
-  if (extractGpuType(title)) return 'GPU';
   return 'GPU';
 }
 
@@ -131,39 +132,194 @@ function extractOEMModel(title) {
   let oem = null;
   for (const b of brands) {
     const re = new RegExp('\\b' + b + '\\b', 'i');
-    if (re.test(t)) { oem = b; break; }
+    if (re.test(t)) { 
+      oem = b; 
+      console.log(`extractOEMModel: Found brand "${b}" in title (regex: /\\b${b}\\b/i)`);
+      break; 
+    }
   }
-  const modelMatch = t.match(/(ROG STRIX|TUF GAMING|VENTUS|SUPRIM|GAMING X TRIO|GAMING X|VENGEANCE LPX|VENGEANCE|TRIDENT Z|DOMINATOR|STRIX|B\d{3,4}[A-Z\-]*|Z\d{3,4}[A-Z\-]*|X\d{3,4}[A-Z\-]*|RTX\s*-?\s*\d{3,4}(?:\s*TI|\s*SUPER)?|GTX\s*-?\s*\d{3,4}|RX\s*-?\s*\d{3,4}(?:\s*XT|\s*XTX)?)/i);
-  let model = modelMatch ? modelMatch[0].trim() : null;
-  if (!model && oem) {
+
+  const suffixPatterns = [
+    'xc3','xc ultra','xc','ftw3','ftw','sc2','sc','hybrid','hydro copper','kingpin','ko',
+    'gaming x trio','gaming x','gaming','rog','strix','tuf','ventus','suprim','dual',
+    'prime','proart','aorus','vision','eagle','master','windforce','oc','ultra'
+  ];
+  const suffixRegex = new RegExp('\\b(?:' + suffixPatterns.join('|') + ')\\b', 'i');
+  const suffixMatch = t.match(suffixRegex);
+  let model = suffixMatch ? suffixMatch[0].trim() : null;
+  if (suffixMatch) console.log(`extractOEMModel: Found suffix model "${suffixMatch[0]}" from patterns`);
+
+  if (!model) {
+    const modelMatch = t.match(/(ROG STRIX|TUF GAMING|VENTUS|SUPRIM|GAMING X TRIO|GAMING X|VENGEANCE LPX|VENGEANCE|TRIDENT Z|DOMINATOR|STRIX|B\d{3,4}[A-Z\-]*|Z\d{3,4}[A-Z\-]*|X\d{3,4}[A-Z\-]*|RTX\s*-?\s*\d{3,4}(?:\s*TI|\s*SUPER)?|GTX\s*-?\s*\d{3,4}|RX\s*-?\s*\d{3,4}(?:\s*XT|\s*XTX)?)/i);
+    model = modelMatch ? modelMatch[0].trim() : null;
+    if (modelMatch) console.log(`extractOEMModel: Found regex model "${modelMatch[0]}"`);
+  }
+
+  if ((!model || /RTX|GTX|RX/i.test(model)) && oem) {
     const re = new RegExp(oem + '\\s+([A-Z0-9][A-Za-z0-9\\- ]{1,40})', 'i');
     const m = t.match(re);
-    if (m) model = m[1].trim().split(/\s{2,}|\s/).slice(0,4).join(' ');
+    if (m) {
+      const candidate = m[1].trim().split(/\s{2,}|\s/).slice(0,4).join(' ');
+      if (!model || !/RTX|GTX|RX/i.test(candidate)) {
+        model = candidate;
+        console.log(`extractOEMModel: Found OEM-specific model "${candidate}" after "${oem}"`);
+      }
+    }
   }
+
+  console.log(`extractOEMModel result: oem="${oem}", model="${model}" from title: "${title.substring(0, 80)}..."`);
   return { oem: oem, model: model };
 }
 
-// Find the best matching key in category data using candidate strings
-function findBestMatch(categoryData, candidates) {
-  if (!categoryData) return null;
-  for (const c of candidates) {
-    if (!c) continue;
-    if (categoryData[c]) return categoryData[c];
+function normalizeKey(key) {
+  if (!key) return '';
+  return String(key)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/['"\u2019\u2018]/g, '')
+    .replace(/-+/g, ' ')
+    .trim();
+}
+
+function findMatchInObject(dataObj, candidates) {
+  if (!dataObj || typeof dataObj !== 'object') return null;
+  const keys = Object.keys(dataObj);
+  const normalizedKeys = keys.map(k => ({ raw: k, norm: normalizeKey(k) }));
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const target = normalizeKey(candidate);
+    if (!target) continue;
+    const exact = normalizedKeys.find(k => k.norm === target);
+    if (exact) return dataObj[exact.raw];
   }
-  const keys = Object.keys(categoryData);
-  for (const c of candidates) {
-    if (!c) continue;
-    const lc = c.toLowerCase();
-    const k = keys.find(k => k.toLowerCase() === lc);
-    if (k) return categoryData[k];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const target = normalizeKey(candidate);
+    if (!target) continue;
+    const partial = normalizedKeys.find(k => k.norm.includes(target) || target.includes(k.norm));
+    if (partial) return dataObj[partial.raw];
   }
-  for (const c of candidates) {
-    if (!c) continue;
-    const lc = c.toLowerCase();
-    const k = keys.find(k => k.toLowerCase().includes(lc) || lc.includes(k.toLowerCase()));
-    if (k) return categoryData[k];
-  }
+
   return null;
+}
+
+function getAverageBreakdown(categoryData, oem, model, gpuType) {
+  const breakdown = { model: null, oem: null, type: null };
+  const normalizedOEM = normalizeKey(oem);
+  const normalizedModel = normalizeKey(model);
+  const normalizedGpuType = normalizeKey(gpuType);
+
+  console.log(`getAverageBreakdown: Looking for model="${model}" (normalized: "${normalizedModel}"), oem="${oem}" (normalized: "${normalizedOEM}"), gpuType="${gpuType}" (normalized: "${normalizedGpuType}")`);
+
+  // Models are now nested by Type, then OEM, then Model
+  if (normalizedModel && categoryData.models && normalizedGpuType) {
+    const typeKey = Object.keys(categoryData.models).find(k => normalizeKey(k) === normalizedGpuType);
+    console.log(`getAverageBreakdown: Looking for GPU type key matching "${normalizedGpuType}" in models. Found: ${typeKey}`);
+    
+    if (typeKey) {
+      const modelsByOEM = categoryData.models[typeKey];
+      if (normalizedOEM) {
+        const oemKey = Object.keys(modelsByOEM).find(k => normalizeKey(k) === normalizedOEM);
+        console.log(`getAverageBreakdown: Looking for OEM key matching "${normalizedOEM}" in models[${typeKey}]. Found: ${oemKey}`);
+        if (oemKey) {
+          breakdown.model = findMatchInObject(modelsByOEM[oemKey], [normalizedModel, `${normalizedOEM} ${normalizedModel}`]);
+          if (breakdown.model) console.log(`getAverageBreakdown: Found type-specific model in ${typeKey}/${oemKey}: $${breakdown.model.used} [${breakdown.model.usedVol}]`);
+        }
+      }
+      
+      // If not found in specific OEM, search generically within this GPU type
+      if (!breakdown.model) {
+        console.log(`getAverageBreakdown: No type+OEM specific model found, searching generically across all OEMs in ${typeKey}`);
+        for (const oemKey of Object.keys(modelsByOEM)) {
+          const modelMatch = findMatchInObject(modelsByOEM[oemKey], [normalizedModel]);
+          if (modelMatch) {
+            breakdown.model = modelMatch;
+            console.log(`getAverageBreakdown: Found type-generic model match in ${typeKey}/${oemKey}: $${modelMatch.used} [${modelMatch.usedVol}]`);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (!breakdown.model && normalizedModel && categoryData.modelOnly) {
+    breakdown.model = findMatchInObject(categoryData.modelOnly, [normalizedModel]);
+    if (breakdown.model) console.log(`getAverageBreakdown: Found model in modelOnly: $${breakdown.model.used} [${breakdown.model.usedVol}]`);
+  }
+
+  if (normalizedOEM && categoryData.oems) {
+    breakdown.oem = findMatchInObject(categoryData.oems, [normalizedOEM]);
+    if (breakdown.oem) console.log(`getAverageBreakdown: Found OEM "${normalizedOEM}": $${breakdown.oem.used} [${breakdown.oem.usedVol}]`);
+  }
+
+  if (normalizedGpuType && categoryData.types) {
+    breakdown.type = findMatchInObject(categoryData.types, [normalizedGpuType]);
+    if (breakdown.type) console.log(`getAverageBreakdown: Found GPU type "${normalizedGpuType}": $${breakdown.type.used} [${breakdown.type.usedVol}]`);
+  }
+
+  console.log(`getAverageBreakdown result:`, breakdown);
+  return breakdown;
+}
+
+// Find the best matching key in category data using candidate strings
+function findBestMatch(categoryData, candidates, context = {}) {
+  if (!categoryData) return null;
+  const oem = normalizeKey(context.oem);
+  const model = normalizeKey(context.model);
+  const normCandidates = candidates.map(normalizeKey).filter(Boolean);
+
+  // If the data set is a flat mapping like old style { '3080': { used: ... }}
+  const direct = findMatchInObject(categoryData, normCandidates);
+  if (direct) return direct;
+
+  // Models by OEM have the highest specificity.
+  if (oem && model && categoryData.models) {
+    const oemKey = Object.keys(categoryData.models).find(k => normalizeKey(k) === oem);
+    if (oemKey) {
+      const modelMatch = findMatchInObject(categoryData.models[oemKey], [model, `${oem} ${model}`]);
+      if (modelMatch) return modelMatch;
+    }
+  }
+
+  // Generic model matches across any OEM.
+  if (model && categoryData.models) {
+    for (const oemKey of Object.keys(categoryData.models)) {
+      const modelMatch = findMatchInObject(categoryData.models[oemKey], [model]);
+      if (modelMatch) return modelMatch;
+    }
+  }
+
+  // OEM-level averages.
+  if (oem && categoryData.oems) {
+    const oemMatch = findMatchInObject(categoryData.oems, [oem]);
+    if (oemMatch) return oemMatch;
+  }
+
+  // Type-level averages.
+  if (categoryData.types) {
+    const typeMatch = findMatchInObject(categoryData.types, normCandidates);
+    if (typeMatch) return typeMatch;
+  }
+
+  // Fallback to bare model-only averages.
+  if (categoryData.modelOnly) {
+    const modelOnlyMatch = findMatchInObject(categoryData.modelOnly, normCandidates);
+    if (modelOnlyMatch) return modelOnlyMatch;
+  }
+
+  return null;
+}
+
+function getCategoryData() {
+  const byCategory = (typeof dataByCategory !== 'undefined') ? dataByCategory : {};
+  return {
+    GPU: byCategory.GPU || (typeof gpuAverages !== 'undefined' ? gpuAverages : {}),
+    RAM: byCategory.RAM || (typeof ramAverages !== 'undefined' ? ramAverages : {}),
+    Motherboard: byCategory.Motherboard || (typeof motherboardAverages !== 'undefined' ? motherboardAverages : {})
+  };
 }
 
 function showMessage(message, gpuType = 'GPU') {
@@ -217,7 +373,8 @@ function attemptShowRecommendation() {
   const currentPrice = extractPrice();
   const category = detectCategory(title);
   const { oem, model } = extractOEMModel(title);
-  const dataByCategory = window.dataByCategory || { GPU: window.gpuAverages || {}, RAM: window.ramAverages || {}, Motherboard: window.motherboardAverages || {} };
+  const dataByCategory = getCategoryData();
+  console.log('GPU extension (detail): dataByCategory types', typeof dataByCategory, 'gpuAverages', typeof gpuAverages, 'ramAverages', typeof ramAverages, 'motherboardAverages', typeof motherboardAverages);
   const categoryData = dataByCategory[category] || {};
 
   // Candidate keys to try: model, OEM+model, gpuType (for GPUs), title fragments
@@ -228,7 +385,7 @@ function attemptShowRecommendation() {
   if (gpuType) candidates.push(gpuType);
   candidates.push(title.trim());
 
-  const average = findBestMatch(categoryData, candidates) || null;
+  const average = findBestMatch(categoryData, candidates, { oem, model }) || null;
 
   console.log('Title used for extraction:', title);
   console.log('Detected category:', category);
@@ -257,7 +414,7 @@ function addBadgeToItem(item, statusIndicator, textColor, gpuData, currentPrice)
   badge.className = 'gpu-recommendation-badge';
   badge.style.cssText = `
     position: absolute;
-    top: 8px;
+    bottom: 8px;
     right: 8px;
     background: white;
     padding: 8px 10px;
@@ -270,24 +427,48 @@ function addBadgeToItem(item, statusIndicator, textColor, gpuData, currentPrice)
     line-height: 1.4;
   `;
   
-  // Calculate percentage differences
-  const usedPriceVal = Number(gpuData.usedPrice) || 0;
-  const partsPriceVal = Number(gpuData.partsPrice) || 0;
-  const usedDiff = usedPriceVal ? ((currentPrice - usedPriceVal) / usedPriceVal * 100).toFixed(0) : 'N/A';
-  const partsDiff = partsPriceVal ? ((currentPrice - partsPriceVal) / partsPriceVal * 100).toFixed(0) : null;
-  
-  // Determine color for percentages (green for negative/cheap, red for positive/expensive)
-  const usedColor = usedDiff < 0 ? '#00aa00' : '#cc0000';
-  const partsColor = partsDiff < 0 ? '#00aa00' : '#cc0000';
-  
+  function getColorForDiff(diff) {
+    return diff < 0 ? '#00aa00' : '#cc0000';
+  }
+
+  function formatPriceLine(price, vol, diff) {
+    const diffPercent = diff !== null && diff !== 'N/A' ? `${diff > 0 ? '+' : ''}${diff}%` : 'N/A';
+    const color = getColorForDiff(parseFloat(diff));
+    return `$${price} [${vol}] <span style="color: ${color};">(${diffPercent})</span>`;
+  }
+
   // Build badge content with item label and colored prices
-  const label = gpuData.type || gpuData.label || gpuData.model || gpuData.oem || 'Item';
+  const typeLabel = gpuData.type ? `${gpuData.type} ` : '';
+  const label = gpuData.label || (gpuData.oem && gpuData.model ? `${typeLabel}${gpuData.oem} ${gpuData.model}` : gpuData.model || gpuData.type || gpuData.oem || 'Item');
   let badgeHTML = `${label}<br>`;
-  badgeHTML += `Used: $${usedPriceVal} <span style="color: ${usedColor}">(${usedDiff !== 'N/A' ? (usedDiff > 0 ? '+' : '') + usedDiff + '%' : 'N/A'})</span> [${gpuData.usedVol || 0}]<br>`;
-  if (partsPriceVal > 0) {
-    badgeHTML += `Parts: $${partsPriceVal} <span style="color: ${partsColor}">(${partsDiff > 0 ? '+' : ''}${partsDiff}%)</span> [${gpuData.partsVol || 0}]`;
-  } else {
-    badgeHTML += `Parts: N/A`;
+
+  if (gpuData.modelAvg) {
+    const modelUsedPrice = Number(gpuData.modelAvg.used) || 0;
+    const modelPartsPrice = Number(gpuData.modelAvg.parts) || 0;
+    const modelUsedDiff = modelUsedPrice ? ((currentPrice - modelUsedPrice) / modelUsedPrice * 100).toFixed(0) : 'N/A';
+    const modelPartsDiff = modelPartsPrice ? ((currentPrice - modelPartsPrice) / modelPartsPrice * 100).toFixed(0) : 'N/A';
+    const modelLabel = gpuData.model
+      ? `${gpuData.type ? `${gpuData.type} ` : ''}${gpuData.oem ? `${gpuData.oem} ` : ''}${gpuData.model}`
+      : (gpuData.type && gpuData.oem ? `${gpuData.type} ${gpuData.oem} Model` : 'Model');
+    badgeHTML += `${modelLabel}: ${formatPriceLine(modelUsedPrice, gpuData.modelAvg.usedVol || 0, modelUsedDiff)} | ${formatPriceLine(modelPartsPrice, gpuData.modelAvg.partsVol || 0, modelPartsDiff)}<br>`;
+  }
+
+  if (gpuData.oemAvg) {
+    const oemUsedPrice = Number(gpuData.oemAvg.used) || 0;
+    const oemPartsPrice = Number(gpuData.oemAvg.parts) || 0;
+    const oemUsedDiff = oemUsedPrice ? ((currentPrice - oemUsedPrice) / oemUsedPrice * 100).toFixed(0) : 'N/A';
+    const oemPartsDiff = oemPartsPrice ? ((currentPrice - oemPartsPrice) / oemPartsPrice * 100).toFixed(0) : 'N/A';
+    const oemLabel = gpuData.type ? `${gpuData.type} ${gpuData.oem || 'OEM'}` : (gpuData.oem || 'OEM');
+    badgeHTML += `${oemLabel}: ${formatPriceLine(oemUsedPrice, gpuData.oemAvg.usedVol || 0, oemUsedDiff)} | ${formatPriceLine(oemPartsPrice, gpuData.oemAvg.partsVol || 0, oemPartsDiff)}<br>`;
+  }
+
+  if (gpuData.typeAvg) {
+    const typeUsedPrice = Number(gpuData.typeAvg.used) || 0;
+    const typePartsPrice = Number(gpuData.typeAvg.parts) || 0;
+    const typeUsedDiff = typeUsedPrice ? ((currentPrice - typeUsedPrice) / typeUsedPrice * 100).toFixed(0) : 'N/A';
+    const typePartsDiff = typePartsPrice ? ((currentPrice - typePartsPrice) / typePartsPrice * 100).toFixed(0) : 'N/A';
+    const typeLabel = gpuData.type || 'Type';
+    badgeHTML += `${typeLabel} avg: ${formatPriceLine(typeUsedPrice, gpuData.typeAvg.usedVol || 0, typeUsedDiff)} | ${formatPriceLine(typePartsPrice, gpuData.typeAvg.partsVol || 0, typePartsDiff)}`;
   }
   
   badge.innerHTML = badgeHTML;
@@ -298,22 +479,31 @@ function addBadgeToItem(item, statusIndicator, textColor, gpuData, currentPrice)
 
 function processSearchResults() {
   const allItems = document.querySelectorAll(
-    '.su-card-container, .srp-results .s-item, .ui-search-result, [data-testid="search-result-item"], .s-item'
+    '.su-card-container, .srp-results .s-item, .ui-search-result, [data-testid="search-result-item"], .s-item, li.s-item, [role="listitem"], .ebayui-dne-item-featured-card, .gallery-item'
   );
+  console.log('GPU extension: processSearchResults started, items found:', allItems.length);
   if (!allItems.length) {
     console.log('GPU extension: no search items found yet');
+    return;
+  }
+
+  const uncheckedItems = Array.from(allItems).filter(item => !item.dataset.gpuPriceChecked);
+  if (!uncheckedItems.length) {
+    console.log('GPU extension: all items already processed, skipping repeated run');
+    return;
   }
 
   let debugCount = 0;
-  allItems.forEach(item => {
-    if (item.dataset.gpuPriceChecked) return;
+  let matchedCount = 0;
+  let skippedCount = 0;
+  uncheckedItems.forEach(item => {
     item.dataset.gpuPriceChecked = 'true';
 
     const titleEl = item.querySelector(
-      '.s-card__title, .s-item__title, .ui-search-item__title, h2, h3, [data-testid="item-title"]'
+      '.s-card__title, .s-item__title, .ui-search-item__title, h2, h3, [data-testid="item-title"], .ux-textspans, .title, .listing-title'
     );
     const priceEl = item.querySelector(
-      '.s-card__price, .s-item__price, .ui-search-price__part, .s-item__detail span, .price, [data-testid="item-price"]'
+      '.s-card__price, .s-item__price, .ui-search-price__part, .s-item__detail span, .price, [data-testid="item-price"], [data-price], .s-item__price span'
     );
 
     if (!titleEl || !priceEl) {
@@ -327,31 +517,49 @@ function processSearchResults() {
     const title = titleEl.textContent.trim();
     const priceText = priceEl.textContent.trim();
     const priceMatch = priceText.match(/\$?(\d+(?:\.\d{2})?)/);
-    if (!priceMatch) return;
+    if (!priceMatch) {
+      skippedCount += 1;
+      return;
+    }
 
     const price = parseFloat(priceMatch[1]);
     const category = detectCategory(title);
     const { oem, model } = extractOEMModel(title);
-    const dataByCategory = window.dataByCategory || { GPU: window.gpuAverages || {}, RAM: window.ramAverages || {}, Motherboard: window.motherboardAverages || {} };
+    const dataByCategory = getCategoryData();
+    console.log('GPU extension: dataByCategory types', typeof dataByCategory, 'gpuAverages', typeof gpuAverages, 'ramAverages', typeof ramAverages, 'motherboardAverages', typeof motherboardAverages);
     const categoryData = dataByCategory[category] || {};
+    console.log('GPU extension: candidate category', category, 'categoryData keys', Object.keys(categoryData).slice(0,10), 'total', Object.keys(categoryData).length);
     const gpuType = extractGpuType(title);
     const candidates = [];
     if (model) candidates.push(model);
     if (oem && model) candidates.push(`${oem} ${model}`);
     if (gpuType) candidates.push(gpuType);
     candidates.push(title.trim());
-    const average = findBestMatch(categoryData, candidates);
-    if (!average) return;
+    const average = findBestMatch(categoryData, candidates, { oem, model });
+    if (!average) {
+      console.log('GPU extension: no average match', { title, category, oem, model, candidates, keysSample: Object.keys(categoryData).slice(0,10) });
+      skippedCount += 1;
+      return;
+    }
 
+    const averages = getAverageBreakdown(categoryData, oem, model, gpuType);
+    matchedCount += 1;
     const baseline = average.used || average;
     const recommended = baseline * 0.8;
 
+    const label = [oem, model].filter(Boolean).join(' ') || gpuType || title;
     const itemData = {
-      label: model || gpuType || title,
+      label,
+      type: gpuType,
+      oem,
+      model,
       usedPrice: average.used,
       partsPrice: average.parts || 0,
       usedVol: average.usedVol || 0,
-      partsVol: average.partsVol || 0
+      partsVol: average.partsVol || 0,
+      modelAvg: averages.model,
+      oemAvg: averages.oem,
+      typeAvg: averages.type
     };
 
     let statusIndicator, textColor;
@@ -368,6 +576,7 @@ function processSearchResults() {
 
     addBadgeToItem(item, statusIndicator, textColor, itemData, price);
   });
+  console.log('GPU extension: processSearchResults finished, matched items:', matchedCount, 'skipped items:', skippedCount);
 }
 
 function isSearchResultsPage() {

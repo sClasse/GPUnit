@@ -1,3 +1,4 @@
+# TODO Add outlier protection to data that is used in the firefox extension averages.
 import csv
 import os
 import pandas as pd

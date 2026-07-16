@@ -224,11 +224,32 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
     i = {}
     error = {}
 
-    # Sale Date
-    sale_date = item.find('div', class_='s-card__caption')
+    # Sale Date (handle old and new eBay HTML)
     try:
-        i['Sale_Date'] = sale_date.find('span', class_='positive').text.replace("Sold  ", "")
-        i['Sale_Date'] = datetime.strptime(i['Sale_Date'], "%b %d, %Y").strftime("%Y-%m-%d")
+        sale_date_text = None
+        # old structure
+        caption = item.find('div', class_='s-card__caption')
+        if caption:
+            pos = caption.find('span', class_='positive')
+            if pos and pos.get_text(strip=True):
+                sale_date_text = pos.get_text(strip=True).replace('Sold', '').strip()
+
+        # new structure: look for signal span or any span starting with 'Sold'
+        if not sale_date_text:
+            sig = item.select_one('span.signal, span.signal--recent, span.signal--recent')
+            if sig and sig.get_text(strip=True).lower().startswith('sold'):
+                sale_date_text = sig.get_text(strip=True).replace('Sold', '').strip()
+            else:
+                for sp in item.find_all('span'):
+                    t = sp.get_text(strip=True)
+                    if t and t.startswith('Sold'):
+                        sale_date_text = t.replace('Sold', '').strip()
+                        break
+
+        if not sale_date_text:
+            raise ValueError('sale date not found')
+
+        i['Sale_Date'] = datetime.strptime(sale_date_text, "%b %d, %Y").strftime("%Y-%m-%d")
     except Exception:
         print(f"Error finding 'Sale Date' for {keyword} ({product_config.name})")
         error['Error Type'] = 'Sale Date'
@@ -244,10 +265,28 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
         error['item Content'] = item
         return None, error
 
-    # Title
+    # Title (support multiple class patterns)
     try:
-        i['Title'] = item.find('div', class_='s-card__title').find('span').text
-        i['Title'] = i['Title'].encode('utf-8', 'ignore').decode('utf-8', 'ignore')
+        def _first_text(selectors):
+            for s in selectors:
+                el = item.select_one(s)
+                if el and el.get_text(strip=True):
+                    return el.get_text(strip=True)
+            return None
+
+        title_selectors = [
+            'div.s-card__title span',
+            'a.su-link.su-item-card__title span',
+            'div.su-card-container__header a span',
+            'h3.s-item__title',
+            'a.s-item__link h3'
+        ]
+
+        title_text = _first_text(title_selectors)
+        if not title_text:
+            raise ValueError('title not found')
+
+        i['Title'] = title_text.encode('utf-8', 'ignore').decode('utf-8', 'ignore')
     except Exception:
         i['Title'] = "Unknown"
 
@@ -297,10 +336,30 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
         i['Details-3'] = 'Missing'
         i['Details-4'] = 'Missing'
 
-    # Price
+    # Price (robust extraction)
     try:
-        i['Price'] = item.find('span', class_='s-card__price').text.strip("$")
-        i['Price'] = float(i['Price'].replace(",", ""))
+        price_selectors = ['span.s-card__price', 'span.su-item-card__price', 'span.s-item__price', 'div.su-card-container__footer span']
+        price_text = None
+        for sel in price_selectors:
+            p_el = item.select_one(sel)
+            if p_el and p_el.get_text(strip=True):
+                price_text = p_el.get_text(strip=True)
+                break
+
+        # fallback: search for dollar amount anywhere in item
+        if not price_text:
+            m = re.search(r'\$[0-9\.,]+', item.get_text())
+            price_text = m.group(0) if m else None
+
+        if not price_text:
+            raise ValueError('price not found')
+
+        # normalize and parse
+        price_num = re.search(r'\$?([0-9\,]+(?:\.[0-9]{1,2})?)', price_text)
+        if price_num:
+            i['Price'] = float(price_num.group(1).replace(',', ''))
+        else:
+            raise ValueError('price parse failed')
     except Exception:
         i['Price'] = 0.00
         print(f"Error finding 'Price' for {keyword} ({product_config.name})")
@@ -308,9 +367,30 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
         error['item Content'] = item
         return i, error  # Return listing even with price error
 
-    # Seller
+    # Seller (try new attribute container, then fallbacks)
     try:
-        i['Seller'] = item.find('div', class_='su-card-container__attributes__secondary').text.split(' ')[0].strip()
+        seller = None
+        # new-style container
+        sec = item.select_one('.su-card-container__attributes__secondary')
+        if sec and sec.get_text(strip=True):
+            seller = sec.get_text(strip=True).split('\n')[0].split(' ')[0].strip()
+
+        # common seller link
+        if not seller:
+            s_link = item.select_one('a[href*="/usr/"]') or item.select_one('a[href*="/seller/"]')
+            if s_link and s_link.get_text(strip=True):
+                seller = s_link.get_text(strip=True)
+
+        # older-style
+        if not seller:
+            old = item.select_one('.s-item__seller-info-text')
+            if old and old.get_text(strip=True):
+                seller = old.get_text(strip=True).split(':')[-1].strip()
+
+        if not seller:
+            raise ValueError('seller not found')
+
+        i['Seller'] = seller
     except Exception:
         i['Seller'] = "Missing"
         print(f"Error finding 'Seller' for {keyword} ({product_config.name})")
@@ -318,19 +398,29 @@ def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Di
         error['item Content'] = item
         return i, error
 
-    # Shipping
+    # Shipping (robust extraction from attributes)
     try:
-        shipping_string = item.find_all('div', class_='s-card__attribute-row')[2].text
-        if ('Located in' in shipping_string):
-            i['Shipping'] = 0
-        elif shipping_string == 'Free delivery':
-            i['Shipping'] = 0
-        elif shipping_string == 'Delivery not specified':
-            i['Shipping'] = 0
+        shipping_string = None
+        # new-style attributes primary container
+        primary = item.select_one('.su-card-container__attributes__primary')
+        if primary and primary.get_text(strip=True):
+            shipping_string = primary.get_text(separator=' | ', strip=True)
+
+        # fallback to old attribute rows
+        if not shipping_string:
+            rows = item.find_all('div', class_='s-card__attribute-row')
+            if len(rows) >= 3:
+                shipping_string = rows[2].get_text(strip=True)
+
+        if not shipping_string:
+            shipping_string = item.get_text()
+
+        if 'Located in' in shipping_string or 'Free delivery' in shipping_string or 'Delivery not specified' in shipping_string:
+            i['Shipping'] = 0.00
         else:
-            regex_match = re.search(r'\$(?:(?:[1-9][0-9]{0,2})(?:,[0-9]{3})+|[1-9][0-9]*|0)(?:[.,][0-9][0-9]?)?(?![0-9]+)', shipping_string)
+            regex_match = re.search(r'\$[0-9\,]+(?:\.[0-9]{1,2})?', shipping_string)
             if regex_match:
-                i['Shipping'] = float(regex_match.group(0).strip("+$ shipping"))
+                i['Shipping'] = float(regex_match.group(0).replace('$', '').replace(',', ''))
             else:
                 i['Shipping'] = 0.00
     except Exception:

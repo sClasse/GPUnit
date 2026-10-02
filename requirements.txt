@@ -3,3 +3,5 @@ discord.py
 pandas
 playwright
 beautifulsoup4
+python-dotenv
+playwright-stealth

@@ -5,6 +5,9 @@ __pycache__/
 *.pyd
 .Python
 env/
+.env
+ebay_storage_state.json
+ebay_firefox_profile/
 pip-log.txt
 pip-delete-this-directory.txt
 .tox/

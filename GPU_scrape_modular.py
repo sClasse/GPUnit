@@ -7,13 +7,21 @@
 from bs4 import BeautifulSoup
 import csv
 from datetime import datetime
+import os
 import time
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Dict, Any
+from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import sync_playwright, Page, BrowserContext
 from playwright_stealth import Stealth
+from dotenv import load_dotenv
 import random
+
+load_dotenv()
+
+FIREFOX_PROFILE_DIR = Path(__file__).resolve().parent / "ebay_firefox_profile"
 
 
 @dataclass
@@ -106,114 +114,279 @@ RAM_CONFIG = ProductConfig(
 # ============================================================================
 
 def setup_browser():
-    """Initialize Playwright with Stealth and return browser, context, page, and the Playwright manager."""
+    """Launch headed Firefox with a persistent profile so cookies survive between runs."""
     stealth = Stealth()
     p = stealth.use_sync(sync_playwright())
     context_manager = p.__enter__()
 
     try:
-        browser = context_manager.chromium.launch(
-            headless=False,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-web-security"
-            ]
-        )
+        FIREFOX_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Using persistent Firefox profile: {FIREFOX_PROFILE_DIR}")
 
-        context = browser.new_context(
-            user_agent="AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            viewport={"width": random.randint(1280, 1440), "height": random.randint(820, 980)},
+        context = context_manager.firefox.launch_persistent_context(
+            user_data_dir=str(FIREFOX_PROFILE_DIR),
+            headless=False,
+            viewport={"width": 1366, "height": 768},
             locale="en-US",
             timezone_id="America/New_York",
-            screen={"width": 1920, "height": 1080},
-            device_scale_factor=1
         )
-
-        page = context.new_page()
+        browser = context.browser
+        page = context.pages[0] if context.pages else context.new_page()
         return p, browser, context, page
     except Exception:
         p.__exit__(None, None, None)
         raise
 
 
-def search_ebay(page: Page, keyword: str) -> str:
-    """Navigate eBay and search for keyword, return rendered HTML"""
+def _goto_ebay_homepage(page: Page) -> None:
+    """Navigate to ebay.com without waiting for a full load, then pause 5–15 seconds."""
     try:
-        # Start from eBay homepage and type the query to avoid direct-search blocking
-        page.goto("https://www.ebay.com/")
+        page.goto("https://www.ebay.com/", wait_until="commit", timeout=10000)
+    except Exception as e:
+        print(f"[DEBUG] Homepage did not finish loading ({e}); continuing after wait")
+    time.sleep(random.uniform(5, 15))
 
-        # Wait for a known search input to appear
+
+def _wait_for_stable_page(page: Page, timeout_ms: int = 15000) -> None:
+    """Wait until the page finishes navigating so Playwright calls don't hit a dead context."""
+    deadline = time.time() + timeout_ms / 1000
+    last_url = None
+    while time.time() < deadline:
         try:
-            page.wait_for_selector('input#gh-ac, input[name="_nkw"], input[aria-label*="Search"]', timeout=10000)
+            page.wait_for_load_state("domcontentloaded", timeout=3000)
+            url = page.url
+            if url == last_url:
+                page.evaluate("1")
+                return
+            last_url = url
+            time.sleep(0.4)
+        except Exception:
+            time.sleep(0.5)
+
+
+def _current_search_keyword(page: Page) -> str | None:
+    """Read the search keyword from the current eBay results URL, if any."""
+    try:
+        qs = parse_qs(urlparse(page.url).query)
+        values = qs.get("_nkw") or qs.get("nkw") or []
+        if values:
+            return values[0]
+    except Exception:
+        return None
+    return None
+
+
+def _has_search_results(page: Page) -> bool:
+    try:
+        return page.locator("ul.srp-results li").count() > 0
+    except Exception:
+        return False
+
+
+def _match_config_keyword(raw_keyword: str | None, search_keywords: List[str]) -> str | None:
+    if not raw_keyword:
+        return None
+    raw_lower = raw_keyword.lower().strip()
+    for kw in search_keywords:
+        if kw.lower() == raw_lower:
+            return kw
+    for kw in search_keywords:
+        if kw.lower() in raw_lower:
+            return kw
+    return None
+
+
+def _ebay_is_logged_in(page: Page) -> bool:
+    """Return True if the eBay header indicates a signed-in session."""
+    for _ in range(4):
+        try:
+            if page.locator('a:has-text("Sign in")').first.is_visible(timeout=1500):
+                return False
         except Exception:
             pass
 
-        # Pick the first available search input selector
-        if page.query_selector('input#gh-ac'):
-            search_sel = 'input#gh-ac'
-        elif page.query_selector('input[name="_nkw"]'):
-            search_sel = 'input[name="_nkw"]'
-        else:
-            search_sel = 'input[aria-label*="Search"]'
-
-        # Small human-like pause before typing
-        time.sleep(random.uniform(1, 3))
-
-        # Focus, type with per-character delay, then submit
         try:
-            page.click(search_sel)
-            page.type(search_sel, str(keyword), delay=random.randint(50, 150))
-            page.keyboard.press("Enter")
+            account_menu = page.query_selector(
+                '#gh-ug.gh-control, button[aria-label*="Account" i], a[href*="myebay"], #gh-eb-My'
+            )
+            if account_menu:
+                return True
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        try:
+            header_text = page.locator("#gh").inner_text(timeout=2000)
+            if re.search(r"\bHi\b", header_text) and "Sign in" not in header_text:
+                return True
         except Exception:
             pass
 
-        # Wait for results to render
+        if _has_search_results(page):
+            return True
+        return False
+    return _has_search_results(page)
+
+
+def ebay_login(page: Page, context: BrowserContext) -> None:
+    """
+    Confirm an authenticated eBay session from the persistent Firefox profile.
+    Opens the homepage only and continues without waiting for keyboard input.
+    """
+    _goto_ebay_homepage(page)
+
+    if _has_search_results(page):
+        kw = _current_search_keyword(page) or "current search"
+        print(f"Search results already open ({kw}); continuing from this page")
+        return
+
+    if _ebay_is_logged_in(page):
+        print("Already signed in to eBay (persistent profile)")
+        return
+
+    print("Warning: not signed in. Continuing with the persistent profile anyway.")
+
+
+def _enable_sold_items_filter(page: Page, keyword: str) -> None:
+    """Enable eBay 'Sold Items' filter on search results (supports old and new UI)."""
+    print(f"[DEBUG] Enabling Sold Items filter for keyword={keyword}")
+
+    try:
+        page.wait_for_selector(
+            'a.su-selection-group__link, input[aria-label="Sold Items"]',
+            timeout=10000,
+        )
+    except Exception:
+        print(f"[DEBUG] Sold Items controls not found for keyword={keyword}")
+        return
+
+    # New UI: link-style toggle in "Show only" selection group
+    sold_link = page.locator(
+        'a.su-selection-group__link:has(.su-selection-group__label--container:text-is("Sold Items"))'
+    )
+
+    if sold_link.count() > 0:
+        sold_toggle = sold_link.first
+        checkbox = sold_toggle.locator('input.checkbox__control[type="checkbox"]')
+        try:
+            if checkbox.count() > 0 and checkbox.is_checked():
+                print(f"[DEBUG] Sold Items already enabled for keyword={keyword}")
+                return
+        except Exception:
+            pass
+
+        print(f"[DEBUG] Clicking Sold Items link for keyword={keyword}")
+        sold_toggle.click(delay=random.randint(50, 150))
+        time.sleep(random.uniform(4, 8))
         try:
             page.wait_for_selector('ul.srp-results, div.srp-controls, div#srp-river-results', timeout=15000)
         except Exception:
             pass
+        print(f"[DEBUG] Sold Items link clicked for keyword={keyword}")
+        return
 
-        time.sleep(random.uniform(8, 12))
+    # Legacy UI: visible checkbox input
+    sold_checkbox = page.query_selector('input[aria-label="Sold Items"]')
+    if sold_checkbox:
+        print(f"[DEBUG] Found legacy Sold Items checkbox for keyword={keyword}")
+        sold_checkbox.click()
+        time.sleep(random.uniform(4, 8))
+        print(f"[DEBUG] Clicked legacy Sold Items checkbox for keyword={keyword}")
+        return
 
-        # Explicitly enable Sold Items and 240 results per page if present
-        try:
-            sold_checkbox = page.query_selector('input[aria-label="Sold Items"]')
-            print(f"[DEBUG] Searching for Sold Items checkbox for keyword={keyword}")
-            if sold_checkbox:
-                print(f"[DEBUG] Found Sold Items checkbox; visible={sold_checkbox.is_visible()}, enabled={sold_checkbox.is_enabled()}")
-                page.evaluate('(el) => el.click()', sold_checkbox)
-                page.wait_for_timeout(2000)
-                print(f"[DEBUG] Clicked Sold Items checkbox for keyword={keyword}")
-            else:
-                print(f"[DEBUG] Sold Items checkbox not found for keyword={keyword}")
-        except Exception as e:
-            print(f"[DEBUG] Sold Items click exception for keyword={keyword}: {e}")
+    print(f"[DEBUG] Sold Items toggle not found for keyword={keyword}")
 
-        try:
-            ipp_button = page.query_selector('button[aria-controls="srp-ipp-menu-content"]')
-            if ipp_button:
-                ipp_button.click()
-                page.wait_for_selector('#srp-ipp-menu-content', timeout=10000)
-                page.click('#srp-ipp-menu-content >> text="240"')
-                page.wait_for_selector('ul.srp-results', timeout=15000)
-        except Exception:
-            pass
 
+def _pick_search_selector(page: Page) -> str:
+    if page.query_selector('input#gh-ac'):
+        return 'input#gh-ac'
+    if page.query_selector('input[name="_nkw"]'):
+        return 'input[name="_nkw"]'
+    return 'input[aria-label*="Search"]'
+
+
+def _results_url_has_param(page: Page, name: str, value: str) -> bool:
+    try:
+        qs = parse_qs(urlparse(page.url).query)
+        return value in qs.get(name, [])
     except Exception:
-        # Fallback: direct navigation if homepage flow fails
-        try:
-            page.goto(f'https://www.ebay.com/sch/i.html?_nkw={keyword}&_sacat=0&_ipg=240&rt=nc&LH_Sold=1', timeout=30000)
-            try:
-                page.wait_for_selector('ul.srp-results', timeout=15000)
-            except Exception:
-                pass
-        except Exception:
-            print(f"Error Loading Search Results for {keyword}")
-            pass
+        return False
 
-    return page.content()
+
+def _submit_search_term(page: Page, keyword: str) -> None:
+    """Type a new keyword into the header search box on the current page and submit."""
+    search_sel = _pick_search_selector(page)
+    time.sleep(random.uniform(1, 3))
+    page.click(search_sel, timeout=10000)
+    page.fill(search_sel, "")
+    page.type(search_sel, str(keyword), delay=random.randint(50, 150))
+    page.keyboard.press("Enter")
+    try:
+        page.wait_for_selector(
+            'ul.srp-results, div.srp-controls, div#srp-river-results',
+            timeout=20000,
+        )
+    except Exception:
+        pass
+    time.sleep(random.uniform(8, 12))
+
+
+def search_ebay(page: Page, keyword: str, context: BrowserContext | None = None) -> str:
+    """Search for keyword from the current eBay page and return rendered HTML."""
+    try:
+        current_kw = _current_search_keyword(page)
+        if (
+            current_kw
+            and current_kw.lower() == str(keyword).lower()
+            and _has_search_results(page)
+        ):
+            print(f"[DEBUG] Reusing already-open sold results for keyword={keyword}")
+            return page.content()
+
+        on_results = _has_search_results(page) or "/sch/" in page.url
+        if on_results:
+            print(f"[DEBUG] Searching for {keyword} from current results page (no homepage)")
+            _submit_search_term(page, keyword)
+        else:
+            print(f"[DEBUG] Not on results yet; opening homepage once for {keyword}")
+            _goto_ebay_homepage(page)
+            _submit_search_term(page, keyword)
+
+        if not _results_url_has_param(page, "LH_Sold", "1"):
+            try:
+                _enable_sold_items_filter(page, keyword)
+            except Exception as e:
+                print(f"[DEBUG] Sold Items click exception for keyword={keyword}: {e}")
+            time.sleep(random.uniform(4, 8))
+        else:
+            print(f"[DEBUG] Sold Items already in URL for keyword={keyword}")
+
+        if not _results_url_has_param(page, "_ipg", "240"):
+            try:
+                ipp_button = page.query_selector('button[aria-controls="srp-ipp-menu-content"]')
+                if ipp_button:
+                    ipp_button.click(delay=random.randint(50, 150))
+                    page.wait_for_selector('#srp-ipp-menu-content', timeout=10000)
+                    time.sleep(random.uniform(0.8, 1.8))
+                    page.click('#srp-ipp-menu-content >> text="240"', delay=random.randint(50, 150))
+                    try:
+                        page.wait_for_selector('ul.srp-results', timeout=15000)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[DEBUG] 240 IPP click exception for keyword={keyword}: {e}")
+        else:
+            print(f"[DEBUG] 240 per page already in URL for keyword={keyword}")
+
+    except Exception as e:
+        print(f"Error Loading Search Results for {keyword}: {e}")
+
+    try:
+        return page.content()
+    except Exception as e:
+        print(f"Could not read page HTML for {keyword}: {e}")
+        time.sleep(2)
+        return page.content()
 
 
 def parse_listing(item, keyword: str, product_config: ProductConfig) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
@@ -583,6 +756,45 @@ def write_results(results: List[Dict[str, Any]], errors: List[Dict[str, Any]], p
 # MAIN SCRAPING ENGINE
 # ============================================================================
 
+def _collect_listings_from_html(
+    html: str,
+    keyword: str,
+    product_config: ProductConfig,
+    results: List[Dict[str, Any]],
+    errors: List[Dict[str, Any]],
+) -> None:
+    if (
+        "Access Denied" in html
+        or "errors.edgesuite.net" in html
+        or "Something went wrong on our end" in html
+    ):
+        print(f"Access Denied / error page still present for {keyword}; skipping")
+        return
+
+    soup = BeautifulSoup(html, 'html.parser')
+    listing_list = soup.find('ul', class_='srp-results')
+
+    if not listing_list:
+        print(f"No listings found for {keyword}")
+        return
+
+    before = len(results)
+    for item in listing_list.find_all("li", recursive=False):
+        if item.find('li', class_='srp-river-answer'):
+            continue
+
+        listing, error = parse_listing(item, keyword, product_config)
+
+        if error and listing is None:
+            errors.append(error)
+        elif listing:
+            results.append(listing)
+            if error:
+                errors.append(error)
+
+    print(f"Parsed {len(results) - before} listings for {keyword}")
+
+
 def scrape_ebay(product_config: ProductConfig) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Universal scraper function that works with any product configuration.
@@ -598,37 +810,29 @@ def scrape_ebay(product_config: ProductConfig) -> tuple[List[Dict[str, Any]], Li
     p, browser, context, page = setup_browser()
 
     try:
-        for keyword in product_config.search_keywords:
+        ebay_login(page, context)
+        _wait_for_stable_page(page)
+
+        remaining_keywords = list(product_config.search_keywords)
+        current_kw = _match_config_keyword(
+            _current_search_keyword(page),
+            remaining_keywords,
+        )
+        if current_kw and _has_search_results(page):
+            print(f"\nTaking over from open results for: {current_kw}")
+            try:
+                html = page.content()
+            except Exception:
+                _wait_for_stable_page(page)
+                html = page.content()
+            _collect_listings_from_html(html, current_kw, product_config, results, errors)
+            remaining_keywords = [kw for kw in remaining_keywords if kw != current_kw]
+            time.sleep(random.uniform(8, 20))
+
+        for keyword in remaining_keywords:
             print(f"\nSearching for: {keyword}")
-            html = search_ebay(page, keyword)
-
-            # Detect Access Denied / challenge pages
-            if "Access Denied" in html or "errors.edgesuite.net" in html:
-                print(f"Access Denied encountered for {keyword}")
-                continue
-
-            soup = BeautifulSoup(html, 'html.parser')
-            listing_list = soup.find('ul', class_='srp-results')
-
-            if not listing_list:
-                print(f"No listings found for {keyword}")
-                continue
-
-            for item in listing_list.find_all("li", recursive=False):
-                if item.find('li', class_='srp-river-answer'):
-                    continue
-
-                listing, error = parse_listing(item, keyword, product_config)
-                
-                if error and listing is None:
-                    # Only error, no listing data
-                    errors.append(error)
-                elif listing:
-                    # Listing parsed successfully (may have partial error)
-                    results.append(listing)
-                    if error:
-                        errors.append(error)
-
+            html = search_ebay(page, keyword, context)
+            _collect_listings_from_html(html, keyword, product_config, results, errors)
             time.sleep(random.uniform(8, 20))
 
     finally:
